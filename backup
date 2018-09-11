@@ -1,0 +1,88 @@
+#!/bin/bash
+
+# /backup contains rsync'ed /home dir and /etc
+
+# http://lwn.net/Articles/572911/  1% of 8Gigs is 80Mb - that probably takes a minute on an USB drive :-)
+VDR=`cat /proc/sys/vm/dirty_ratio`
+VDBR=`cat /proc/sys/vm/dirty_background_ratio`
+sysctl -w vm.dirty_ratio=1
+sysctl -w vm.dirty_background_ratio=1
+
+# External backup disk: LaCie 4G orange 2018-09-06
+DISK=/dev/disk/by-uuid/3cf5277b-1bd1-44cd-92a1-5e469deab7f1
+EXCLUDE="--exclude=tmp/ --exclude=Downloads/ --exclude=downloads/ --exclude=backup/ --exclude=.ecryptfs --exclude=Cache/ --exclude=.thumbnails/"
+
+# Cache is used by firefox, .thumbnails by - I think - F-spot
+
+RSYNC="rsync $EXCLUDE -axHl --link-dest=/backup/current"
+
+error(){
+	echo ERROR: $*
+	echo
+	exit -1
+}
+
+myexit(){
+	error "Caught exception - exiting"
+	sync
+	mount /backup -o remount,ro
+	exit $1
+}
+trap myexit SIGTERM SIGINT
+
+# Function to interpret rsync exit code
+check(){
+	err=$?
+	if [[ $err != 0 && $err != 23 && $err != 24 ]]; then
+		# 0: success, 23: mounted fs (even with -x), 24: source vanished (e.g. web cache files)
+		echo "Rsync failed with error code $err - exiting, and retaining 'current'"
+		myexit $err
+	fi
+}
+
+echo "Backup starting at $(date)"
+
+test -e $DISK || error "Backup volume not available"
+
+echo "Open device with cryptsetup..."
+cryptsetup open $DISK backup
+cryptsetup -v status backup
+
+echo "Mounting disk..."
+
+mount | grep -q /backup && umount /backup
+mount /dev/mapper/backup /backup -o rw 
+mount | grep -q /backup || error "Failed to mount /backup"
+
+echo " backup volume: " `df -h /backup | grep /backup`
+
+DATE="$(date +%Y-%m-%d)"
+TARGET=/backup/$DATE
+test -e $TARGET && error "Backup for $DATE already exists"
+
+echo "Starting rsync: /etc"
+$RSYNC /etc $TARGET
+check
+
+echo "                /home/ketil"
+$RSYNC /home/ketil $TARGET
+check
+
+# echo "                /var"
+# $RSYNC /var  $TARGET
+# check
+
+rm -f /backup/current
+ln -s $DATE /backup/current
+
+sync
+echo "Backup complete $(df -h /backup | grep /backup)"
+
+# Clean up
+mount /backup -o remount,ro
+sysctl -w vm.dirty_ratio=$VDR
+sysctl -w vm.dirty_background_ratio=$VDBR
+
+umount /backup
+cryptsetup luksClose backup
+echo
